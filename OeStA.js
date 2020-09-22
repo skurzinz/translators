@@ -9,7 +9,7 @@
 	"inRepository": true,
 	"translatorType": 4,
 	"browserSupport": "gcsibv",
-	"lastUpdated": "2020-09-21 14:58:00"
+	"lastUpdated": "2020-09-22 14:27:12"
 }
 
 /**
@@ -29,6 +29,8 @@
 	License along with this program. If not, see
 	<http://www.gnu.org/licenses/>.
 	https://www.archivinformationssystem.at/detail.aspx?ID=495489
+	https://www.archivinformationssystem.at/detail.aspx?id=1159
+	https://www.archivinformationssystem.at/detail.aspx?ID=3940521
 	https://www.archivinformationssystem.at/resultatliste.aspx
 */
 
@@ -62,7 +64,7 @@ function scrape(doc, url) {
 	translator.setHandler('itemDone', function (obj, item) {
 		item = new Zotero.Item("manuscript");
 		item.title = ZU.xpathText(doc, '//td[contains(text(), "Titel:")]/following-sibling::td');
-		item.abstractNote = "";
+		item.abstractNote = "//td[@class='archivePlanContext']";
 		item.manuscriptType ="archival";
 		item.date = ZU.xpathText(doc, '//td[contains(text(), "Entstehungszeitraum:")]/following-sibling::td');
 		item.reference = ZU.xpathText(doc, '//td[contains(text(), "Signatur:")]/following-sibling::td');
