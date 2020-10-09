@@ -2,14 +2,14 @@
 	"translatorID": "d92c6e9e-589b-401b-9342-d24ba6556568",
 	"label": "OeStA",
 	"creator": "Stephan Kurz",
-	"target": "^https?://www.archivinformationssystem.at",
+	"target": "^https?://www.archivinformationssystem.at/detail.aspx",
 	"minVersion": "3.0",
 	"maxVersion": "",
 	"priority": 100,
 	"inRepository": true,
 	"translatorType": 4,
 	"browserSupport": "gcsibv",
-	"lastUpdated": "2020-09-22 14:27:12"
+	"lastUpdated": "2020-09-25 11:09:49"
 }
 
 /**
@@ -35,9 +35,9 @@
 */
 
 function detectWeb(doc, url) {
-	/*if (url.search(detail.aspx) != -1) return "manuscript";
-	else if (url.search(resultatliste.aspx) != -1) return "multiple";*/
-	return "manuscript";
+	if (url.search('detail.aspx') != -1) return "manuscript";
+	else if (url.search('resultatliste.aspx') != -1) return "multiple";
+	/* return "manuscript"; */
 }
 
 function scrape(doc, url) {
@@ -64,7 +64,7 @@ function scrape(doc, url) {
 	translator.setHandler('itemDone', function (obj, item) {
 		item = new Zotero.Item("manuscript");
 		item.title = ZU.xpathText(doc, '//td[contains(text(), "Titel:")]/following-sibling::td');
-		item.abstractNote = "//td[@class='archivePlanContext']";
+		item.abstractNote = ZU.xpathText(doc, "//td[@class='archivePlanContext']");
 		item.manuscriptType ="archival";
 		item.date = ZU.xpathText(doc, '//td[contains(text(), "Entstehungszeitraum:")]/following-sibling::td');
 		item.reference = ZU.xpathText(doc, '//td[contains(text(), "Signatur:")]/following-sibling::td');
