@@ -9,13 +9,8 @@
 	"inRepository": true,
 	"translatorType": 4,
 	"browserSupport": "gcsibv",
-	"lastUpdated": "2019-11-09 03:35:55"
+	"lastUpdated": "2024-10-03 14:17:12"
 }
-
-// attr()/text() v2
-// eslint-disable-next-line
-function attr(docOrElem,selector,attr,index){var elem=index?docOrElem.querySelectorAll(selector).item(index):docOrElem.querySelector(selector);return elem?elem.getAttribute(attr):null;}function text(docOrElem,selector,index){var elem=index?docOrElem.querySelectorAll(selector).item(index):docOrElem.querySelector(selector);return elem?elem.textContent:null;} 
-
 
 function detectWeb(doc, url) {
 	if (!doc.body.textContent.trim()) return false;
@@ -39,10 +34,17 @@ function detectWeb(doc, url) {
 		}
 	}
 
-	if (url.search(/\/search[?/]/) != -1 && getArticleList(doc).length > 0) {
-		return "multiple";
+	if (url.search(/\/search[?/]/) != -1) {
+		if (getArticleList(doc).length > 0) {
+			return "multiple";
+		}
+		else if (doc.querySelector('.LoadingOverlay.show')) {
+			// monitor and update the toolbar icon when results have loaded
+			Z.monitorDOMChanges(doc.querySelector('.results-container'));
+			return false;
+		}
 	}
-	if (!url.includes("pdf")) {
+	if (!new URL(url).pathname.includes("pdf")) {
 		// Book sections have the ISBN in the URL
 		if (url.includes("/B978")) {
 			return "bookSection";
@@ -62,96 +64,136 @@ function detectWeb(doc, url) {
 	return false;
 }
 
-function getPDFLink(doc, onDone) {
+async function getPDFLink(doc) {
 	// No PDF access ("Get Full Text Elsewhere" or "Check for this article elsewhere")
 	if (doc.querySelector('.accessContent') || doc.querySelector('.access-options-link-text') || doc.querySelector('#check-access-popover')) {
 		Zotero.debug("PDF is not available");
-		onDone();
-		return;
+		return false;
 	}
 	
 	// Some pages still have the PDF link available
 	var pdfURL = attr(doc, '#pdfLink', 'href');
 	if (!pdfURL) pdfURL = attr(doc, '[name="citation_pdf_url"]', 'content');
 	if (pdfURL && pdfURL != '#') {
-		parseIntermediatePDFPage(pdfURL, onDone);
-		return;
+		Z.debug('Found intermediate URL in head: ' + pdfURL);
+		return parseIntermediatePDFPage(pdfURL);
 	}
 	
 	// If intermediate page URL is available, use that directly
 	var intermediateURL = attr(doc, '.PdfEmbed > object', 'data');
 	if (intermediateURL) {
-		// Zotero.debug("Embedded intermediate PDF URL: " + intermediateURL);
-		parseIntermediatePDFPage(intermediateURL, onDone);
-		return;
+		Zotero.debug("Found embedded PDF URL: " + intermediateURL);
+		if (/[?&]isDTMRedir=(Y|true)/i.test(intermediateURL)) {
+			return intermediateURL;
+		}
+		else {
+			return parseIntermediatePDFPage(intermediateURL);
+		}
 	}
 	
 	// Simulate a click on the "Download PDF" button to open the menu containing the link with the URL
 	// for the intermediate page, which doesn't seem to be available in the DOM after the page load.
 	// This is an awful hack, and we should look out for a better way to get the URL, but it beats
-	// refetching the original source as we do below.
+	// refetching the original source. Works and should be imperceptible to users
+	// when run from the browser, does not work from non-browser translation
+	// environments (e.g. Find Available PDFs in the client). In those cases we
+	// fall back to approach #3: embedded JSON metadata.
 	var pdfLink = doc.querySelector('#pdfLink');
 	if (pdfLink) {
 		// Just in case
 		try {
 			pdfLink.click();
 			intermediateURL = attr(doc, '.PdfDropDownMenu a', 'href');
-			var clickEvent = doc.createEvent('MouseEvents');
-			clickEvent.initEvent('mousedown', true, true);
-			doc.dispatchEvent(clickEvent);
+			doc.body.click();
 		}
 		catch (e) {
 			Zotero.debug(e, 2);
 		}
 		if (intermediateURL) {
 			// Zotero.debug("Intermediate PDF URL from drop-down: " + intermediateURL);
-			parseIntermediatePDFPage(intermediateURL, onDone);
-			return;
+			return parseIntermediatePDFPage(intermediateURL);
 		}
 	}
 	
-	// If none of that worked for some reason, get the URL from the initial HTML, where it is present,
-	// by fetching the page source again. Hopefully this is never actually used.
+	// On some institutional networks with access to ScienceDirect, the site
+	// serves JSON metadata probably used to preload dynamic content without a
+	// separate network request. If we find it, we can take advantage of it to
+	// grab the PDF url's parts directly, constructing it in the same way that
+	// the site's frontend JavaScript would.
+	var json = text(doc, 'script[type="application/json"]');
+	if (json) {
+		try {
+			json = JSON.parse(json);
+			Zotero.debug("Trying to construct PDF URL from JSON data");
+			
+			let urlMetadata = json.article.pdfDownload.urlMetadata;
+			
+			let path = urlMetadata.path;
+			let pdfExtension = urlMetadata.pdfExtension;
+			let pii = urlMetadata.pii;
+			let md5 = urlMetadata.queryParams.md5;
+			let pid = urlMetadata.queryParams.pid;
+			if (path && pdfExtension && pii && md5 && pid){
+				pdfURL = `/${path}/${pii}${pdfExtension}?md5=${md5}&pid=${pid}`;
+				Zotero.debug("Created PDF URL from JSON data: " + pdfURL);
+				return pdfURL;
+			}
+			else {
+				Zotero.debug("Missing elements in JSON data required for URL creation");
+			}
+		}
+		catch (e) {
+			Zotero.debug(e, 2);
+		}
+	}
+
+	// In most cases, appending the suffix seen below to the page's canonical URL
+	// should get us directly to the PDF; it'll yield a URL similar to the one
+	// created by the JSON but without the md5 and pid parameters. It should be
+	// enough to get us through even without those parameters.
+	pdfURL = attr(doc, 'link[rel="canonical"]', 'href');
+	if (pdfURL) {
+		pdfURL = pdfURL + '/pdfft?download=true';
+		Zotero.debug("Trying to construct PDF URL from canonical link: " + pdfURL);
+		return pdfURL;
+	}
+	
+	// If none of that worked for some reason, get the URL from the initial HTML,
+	// where it is present, by fetching the page source again. Hopefully this is
+	// never actually used.
 	var url = doc.location.href;
 	Zotero.debug("Refetching HTML for PDF link");
-	ZU.doGet(url, function (html) {
-		// TODO: Switch to HTTP.request() and get a Document from the XHR
-		var dp = new DOMParser();
-		var doc = dp.parseFromString(html, 'text/html');
-		var intermediateURL = attr(doc, '.pdf-download-btn-link', 'href');
-		// Zotero.debug("Intermediate PDF URL: " + intermediateURL);
-		if (intermediateURL) {
-			parseIntermediatePDFPage(intermediateURL, onDone);
-			return;
-		}
-		onDone();
-	});
+	let reloadedDoc = await requestDocument(url);
+	intermediateURL = attr(reloadedDoc, '.pdf-download-btn-link', 'href');
+	// Zotero.debug("Intermediate PDF URL: " + intermediateURL);
+	if (intermediateURL) {
+		return parseIntermediatePDFPage(intermediateURL);
+	}
+	return false;
 }
 
 
-function parseIntermediatePDFPage(url, onDone) {
+async function parseIntermediatePDFPage(url) {
 	// Get the PDF URL from the meta refresh on the intermediate page
-	ZU.doGet(url, function (html) {
-		var dp = new DOMParser();
-		var doc = dp.parseFromString(html, 'text/html');
-		var pdfURL = attr(doc, 'meta[HTTP-EQUIV="Refresh"]', 'CONTENT');
-		var otherRedirect = attr(doc, '#redirect-message a', 'href');
-		// Zotero.debug("Meta refresh URL: " + pdfURL);
-		if (pdfURL) {
-			// Strip '0;URL='
-			var matches = pdfURL.match(/\d+;URL=(.+)/);
-			pdfURL = matches ? matches[1] : null;
-		}
-		else if (otherRedirect) {
-			pdfURL = otherRedirect;
-		}
-		else if (url.includes('.pdf')) {
-			// Sometimes we are already on the PDF page here and therefore
-			// can simply use the original url as pdfURL.
-			pdfURL = url;
-		}
-		onDone(pdfURL);
-	});
+	Z.debug('Parsing intermediate page to find redirect: ' + url);
+	let doc = await requestDocument(url);
+	var pdfURL = attr(doc, 'meta[HTTP-EQUIV="Refresh"]', 'CONTENT');
+	var otherRedirect = attr(doc, '#redirect-message a', 'href');
+	// Zotero.debug("Meta refresh URL: " + pdfURL);
+	if (pdfURL) {
+		// Strip '0;URL='
+		var matches = pdfURL.match(/\d+;URL=(.+)/);
+		pdfURL = matches ? matches[1] : null;
+	}
+	else if (otherRedirect) {
+		pdfURL = otherRedirect;
+	}
+	else if (url.includes('.pdf')) {
+		// Sometimes we are already on the PDF page here and therefore
+		// can simply use the original url as pdfURL.
+		pdfURL = url;
+	}
+	return pdfURL;
 }
 
 
@@ -231,7 +273,9 @@ function attachSupplementary(doc, item) {
 }
 
 
-function processRIS(doc, text) {
+async function processRIS(doc, text, isSearchResult = false) {
+	let pdfURL = await getPDFLink(doc);
+
 	// T2 doesn't appear to hold the short title anymore.
 	// Sometimes has series title, so I'm mapping this to T3,
 	// although we currently don't recognize that in RIS
@@ -271,6 +315,12 @@ function processRIS(doc, text) {
 	translator.setTranslator("32d59d2d-b65a-4da4-b0a3-bdd3cfb979e7");
 	translator.setString(text);
 	translator.setHandler("itemDone", function (obj, item) {
+		// If the title on the page contains formatting tags, use it instead of the title from the RIS
+		let titleElem = doc.querySelector('h1 > .title-text');
+		if (titleElem && titleElem.childNodes.length > 1) {
+			item.title = titleToString(titleElem);
+		}
+
 		// issue sometimes is set to 0 for single issue volumes (?)
 		if (item.issue === 0) delete item.issue;
 
@@ -279,10 +329,16 @@ function processRIS(doc, text) {
 		for (var i = 0, n = item.creators.length; i < n; i++) {
 			// add spaces after initials
 			if (item.creators[i].firstName) {
-				item.creators[i].firstName = item.creators[i].firstName.replace(/\.\s*(?=\S)/g, '. ');
+				item.creators[i].firstName = item.creators[i].firstName
+					.replace(/\.\s*(?=\S)/g, '. ')
+					.replace(/\s/g, ' '); // NBSP, etc -> space
+			}
+			if (item.creators[i].lastName) {
+				item.creators[i].lastName = item.creators[i].lastName
+					.replace(/\s/g, ' ');
 			}
 			// fix all uppercase lastnames
-			if (item.creators && item.creators[i].lastName.toUpperCase() == item.creators[i].lastName) {
+			if (item.creators[i].lastName.toUpperCase() == item.creators[i].lastName) {
 				item.creators[i].lastName = item.creators[i].lastName.charAt(0) + item.creators[i].lastName.slice(1).toLowerCase();
 			}
 		}
@@ -294,10 +350,12 @@ function processRIS(doc, text) {
 		if (item.abstractNote) {
 			item.abstractNote = item.abstractNote.replace(/^(Abstract|Summary)[\s:\n]*/, "");
 		}
-		item.attachments.push({
-			title: "ScienceDirect Snapshot",
-			document: doc
-		});
+		if (!isSearchResult) {
+			item.attachments.push({
+				title: "ScienceDirect Snapshot",
+				document: doc
+			});
+		}
 
 		// attach supplementary data
 		if (Z.getHiddenPref && Z.getHiddenPref("attachSupplementary")) {
@@ -330,19 +388,32 @@ function processRIS(doc, text) {
 			item.url = "https:" + item.url;
 		}
 
-		getPDFLink(doc, function (pdfURL) {
-			if (pdfURL) {
-				item.attachments.push({
-					title: 'ScienceDirect Full Text PDF',
-					url: pdfURL,
-					mimeType: 'application/pdf',
-					proxy: false
-				});
-			}
-			item.complete();
-		});
+		if (pdfURL) {
+			item.attachments.push({
+				title: 'ScienceDirect Full Text PDF',
+				url: pdfURL,
+				mimeType: 'application/pdf',
+				proxy: false
+			});
+		}
+		item.complete();
 	});
-	translator.translate();
+	await translator.translate();
+}
+
+
+function titleToString(titleElem) {
+	let title = '';
+	for (let node of titleElem.childNodes) {
+		// Wrap italics within the title in <i> for CiteProc
+		if (node.nodeName === 'EM') {
+			title += '<i>' + node.textContent + '</i>';
+		}
+		else {
+			title += node.textContent;
+		}
+	}
+	return title;
 }
 
 
@@ -363,7 +434,7 @@ function getArticleList(doc) {
 	);
 }
 
-function doWeb(doc, url) {
+async function doWeb(doc, url) {
 	if (detectWeb(doc, url) == "multiple") {
 		// search page
 		var itemList = getArticleList(doc);
@@ -372,18 +443,14 @@ function doWeb(doc, url) {
 			items[itemList[i].href] = itemList[i].textContent;
 		}
 
-		Zotero.selectItems(items, function (selectedItems) {
-			if (!selectedItems) return;
-
-			// var articles = [];
-			for (var i in selectedItems) {
-				// articles.push(i);
-				ZU.processDocuments(i, scrape); // move this out of the loop when ZU.processDocuments is fixed
-			}
-		});
+		let selectedItems = await Zotero.selectItems(items);
+		if (!selectedItems) return;
+		for (let url of Object.keys(selectedItems)) {
+			await scrape(await requestDocument(url), url, true);
+		}
 	}
 	else {
-		scrape(doc, url);
+		await scrape(doc, url);
 	}
 }
 
@@ -412,7 +479,7 @@ function formValuesToPostData(values) {
 	return s.substr(1);
 }
 
-function scrape(doc, url) {
+async function scrape(doc, url, isSearchResult = false) {
 	// On most page the export form uses the POST method
 	var form = ZU.xpath(doc, '//form[@name="exportCite"]')[0];
 	if (form) {
@@ -420,9 +487,10 @@ function scrape(doc, url) {
 		var values = getFormInput(form);
 		values['citation-type'] = 'RIS';
 		values.format = 'cite-abs';
-		ZU.doPost(form.action, formValuesToPostData(values), function (text) {
-			processRIS(doc, text);
+		let text = await requestText(form.action, {
+			body: formValuesToPostData(values)
 		});
+		await processRIS(doc, text, isSearchResult);
 		return;
 	}
 
@@ -446,10 +514,9 @@ function scrape(doc, url) {
 		}
 		if (pii) {
 			let risUrl = '/sdfe/arp/cite?pii=' + pii + '&format=application%2Fx-research-info-systems&withabstract=true';
-			// Z.debug(risUrl)
-			ZU.doGet(risUrl, function (text) {
-				processRIS(doc, text);
-			});
+			Z.debug('Fetching RIS using PII: ' + risUrl);
+			let text = await requestText(risUrl);
+			await processRIS(doc, text, isSearchResult);
 			return;
 		}
 	}
@@ -462,16 +529,13 @@ function scrape(doc, url) {
 		Z.debug("Fetching RIS via GET form (old)");
 		let risUrl = form.action
 			+ '?export-format=RIS&export-content=cite-abs';
-		ZU.doGet(risUrl, function (text) {
-			processRIS(doc, text);
-		});
+		let text = await requestText(risUrl);
+		await processRIS(doc, text, isSearchResult);
 		return;
 	}
 
 	throw new Error("Could not scrape metadata via known methods");
 }
-
-
 
 /** BEGIN TEST CASES **/
 var testCases = [
@@ -486,30 +550,30 @@ var testCases = [
 				"creators": [
 					{
 						"lastName": "Schaaf",
-						"firstName": "Christian P.",
+						"firstName": "Christian P.",
 						"creatorType": "author"
 					},
 					{
 						"lastName": "Zoghbi",
-						"firstName": "Huda Y.",
+						"firstName": "Huda Y.",
 						"creatorType": "author"
 					}
 				],
-				"date": "June 9, 2011",
+				"date": "2011-06-09",
 				"DOI": "10.1016/j.neuron.2011.05.025",
 				"ISSN": "0896-6273",
 				"abstractNote": "In this issue, a pair of studies (Levy et al. and Sanders et al.) identify several de novo copy-number variants that together account for 5%–8% of cases of simplex autism spectrum disorders. These studies suggest that several hundreds of loci are likely to contribute to the complex genetic heterogeneity of this group of disorders. An accompanying study in this issue (Gilman et al.), presents network analysis implicating these CNVs in neural processes related to synapse development, axon targeting, and neuron motility.",
 				"issue": "5",
 				"journalAbbreviation": "Neuron",
-				"language": "en",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "806-808",
 				"publicationTitle": "Neuron",
-				"url": "http://www.sciencedirect.com/science/article/pii/S0896627311004430",
+				"url": "https://www.sciencedirect.com/science/article/pii/S0896627311004430",
 				"volume": "70",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
 					},
 					{
 						"title": "ScienceDirect Full Text PDF",
@@ -562,22 +626,22 @@ var testCases = [
 						"creatorType": "author"
 					}
 				],
-				"date": "July 1, 2008",
+				"date": "2008-07-01",
 				"DOI": "10.1016/j.bbamcr.2008.03.010",
 				"ISSN": "0167-4889",
 				"abstractNote": "Mitochondrial involvement in yeast apoptosis is probably the most unifying feature in the field. Reports proposing a role for mitochondria in yeast apoptosis present evidence ranging from the simple observation of ROS accumulation in the cell to the identification of mitochondrial proteins mediating cell death. Although yeast is unarguably a simple model it reveals an elaborate regulation of the death process involving distinct proteins and most likely different pathways, depending on the insult, growth conditions and cell metabolism. This complexity may be due to the interplay between the death pathways and the major signalling routes in the cell, contributing to a whole integrated response. The elucidation of these pathways in yeast has been a valuable help in understanding the intricate mechanisms of cell death in higher eukaryotes, and of severe human diseases associated with mitochondria-dependent apoptosis. In addition, the absence of obvious orthologues of mammalian apoptotic regulators, namely of the Bcl-2 family, favours the use of yeast to assess the function of such proteins. In conclusion, yeast with its distinctive ability to survive without respiration-competent mitochondria is a powerful model to study the involvement of mitochondria and mitochondria interacting proteins in cell death.",
 				"issue": "7",
 				"journalAbbreviation": "Biochimica et Biophysica Acta (BBA) - Molecular Cell Research",
-				"language": "en",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "1286-1302",
 				"publicationTitle": "Biochimica et Biophysica Acta (BBA) - Molecular Cell Research",
 				"series": "Apoptosis in yeast",
-				"url": "http://www.sciencedirect.com/science/article/pii/S016748890800116X",
+				"url": "https://www.sciencedirect.com/science/article/pii/S016748890800116X",
 				"volume": "1783",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
 					},
 					{
 						"title": "ScienceDirect Full Text PDF",
@@ -612,12 +676,12 @@ var testCases = [
 	},
 	{
 		"type": "web",
-		"url": "http://www.sciencedirect.com/science/book/9780123694683",
+		"url": "https://www.sciencedirect.com/book/9780123694683/computational-materials-engineering",
 		"items": "multiple"
 	},
 	{
 		"type": "web",
-		"url": "https://www.sciencedirect.com/science/article/pii/B9780123694683500083",
+		"url": "https://www.sciencedirect.com/science/article/abs/pii/B9780123694683500083",
 		"items": [
 			{
 				"itemType": "bookSection",
@@ -654,19 +718,24 @@ var testCases = [
 						"creatorType": "editor"
 					}
 				],
-				"date": "January 1, 2007",
+				"date": "2007-01-01",
 				"ISBN": "9780123694683",
 				"bookTitle": "Computational Materials Engineering",
 				"extra": "DOI: 10.1016/B978-012369468-3/50008-3",
-				"language": "en",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "267-316",
 				"place": "Burlington",
 				"publisher": "Academic Press",
-				"url": "http://www.sciencedirect.com/science/article/pii/B9780123694683500083",
+				"url": "https://www.sciencedirect.com/science/article/pii/B9780123694683500083",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
+					},
+					{
+						"title": "ScienceDirect Full Text PDF",
+						"mimeType": "application/pdf",
+						"proxy": false
 					}
 				],
 				"tags": [],
@@ -677,7 +746,7 @@ var testCases = [
 	},
 	{
 		"type": "web",
-		"url": "https://www.sciencedirect.com/science/article/pii/B9780123706263000508",
+		"url": "https://www.sciencedirect.com/science/article/abs/pii/B9780123706263000508",
 		"items": [
 			{
 				"itemType": "bookSection",
@@ -694,20 +763,25 @@ var testCases = [
 						"creatorType": "editor"
 					}
 				],
-				"date": "January 1, 2009",
+				"date": "2009-01-01",
 				"ISBN": "9780123706263",
 				"abstractNote": "The African continent (30.1million km2) extends from 37°17′N to 34°52S and covers a great variety of climates except the polar climate. Although Africa is often associated to extended arid areas as the Sahara (7million km2) and Kalahari (0.9million km2), it is also characterized by a humid belt in its equatorial part and by few very wet regions as in Cameroon and in Sierra Leone. Some of the largest river basins are found in this continent such as the Congo, also termed Zaire, Nile, Zambezi, Orange, and Niger basins. Common features of Africa river basins are (i) warm temperatures, (ii) general smooth relief due to the absence of recent mountain ranges, except in North Africa and in the Rift Valley, (iii) predominance of old shields and metamorphic rocks with very developed soil cover, and (iv) moderate human impacts on river systems except for the recent spread of river damming. African rivers are characterized by very similar hydrochemical and physical features (ionic contents, suspended particulate matter, or SPM) but differ greatly by their hydrological regimes, which are more developed in this article.",
 				"bookTitle": "Encyclopedia of Inland Waters",
 				"extra": "DOI: 10.1016/B978-012370626-3.00050-8",
-				"language": "en",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "295-305",
 				"place": "Oxford",
 				"publisher": "Academic Press",
-				"url": "http://www.sciencedirect.com/science/article/pii/B9780123706263000508",
+				"url": "https://www.sciencedirect.com/science/article/pii/B9780123706263000508",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
+					},
+					{
+						"title": "ScienceDirect Full Text PDF",
+						"mimeType": "application/pdf",
+						"proxy": false
 					}
 				],
 				"tags": [
@@ -767,7 +841,7 @@ var testCases = [
 					},
 					{
 						"lastName": "Smith",
-						"firstName": "Jeremy C.",
+						"firstName": "Jeremy C.",
 						"creatorType": "author"
 					},
 					{
@@ -776,22 +850,22 @@ var testCases = [
 						"creatorType": "author"
 					}
 				],
-				"date": "February 22, 2012",
+				"date": "2012-02-22",
 				"DOI": "10.1016/j.bpj.2011.11.4028",
 				"ISSN": "0006-3495",
 				"abstractNote": "To permit access to DNA-binding proteins involved in the control and expression of the genome, the nucleosome undergoes structural remodeling including unwrapping of nucleosomal DNA segments from the nucleosome core. Here we examine the mechanism of DNA dissociation from the nucleosome using microsecond timescale coarse-grained molecular dynamics simulations. The simulations exhibit short-lived, reversible DNA detachments from the nucleosome and long-lived DNA detachments not reversible on the timescale of the simulation. During the short-lived DNA detachments, 9 bp dissociate at one extremity of the nucleosome core and the H3 tail occupies the space freed by the detached DNA. The long-lived DNA detachments are characterized by structural rearrangements of the H3 tail including the formation of a turn-like structure at the base of the tail that sterically impedes the rewrapping of DNA on the nucleosome surface. Removal of the H3 tails causes the long-lived detachments to disappear. The physical consistency of the CG long-lived open state was verified by mapping a CG structure representative of this state back to atomic resolution and performing molecular dynamics as well as by comparing conformation-dependent free energies. Our results suggest that the H3 tail may stabilize the nucleosome in the open state during the initial stages of the nucleosome remodeling process.",
 				"issue": "4",
 				"journalAbbreviation": "Biophysical Journal",
-				"language": "en",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "849-858",
 				"publicationTitle": "Biophysical Journal",
 				"shortTitle": "Unwrapping of Nucleosomal DNA Ends",
-				"url": "http://www.sciencedirect.com/science/article/pii/S0006349512000835",
+				"url": "https://www.sciencedirect.com/science/article/pii/S0006349512000835",
 				"volume": "102",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
 					},
 					{
 						"title": "ScienceDirect Full Text PDF",
@@ -807,7 +881,7 @@ var testCases = [
 	},
 	{
 		"type": "web",
-		"url": "https://www.sciencedirect.com/science/article/pii/S014067361362228X",
+		"url": "https://www.sciencedirect.com/science/article/abs/pii/S014067361362228X",
 		"items": [
 			{
 				"itemType": "journalArticle",
@@ -859,25 +933,26 @@ var testCases = [
 						"creatorType": "author"
 					}
 				],
-				"date": "January 18, 2014",
+				"date": "2014-01-18",
 				"DOI": "10.1016/S0140-6736(13)62228-X",
 				"ISSN": "0140-6736",
 				"abstractNote": "Research publication can both communicate and miscommunicate. Unless research is adequately reported, the time and resources invested in the conduct of research is wasted. Reporting guidelines such as CONSORT, STARD, PRISMA, and ARRIVE aim to improve the quality of research reports, but all are much less adopted and adhered to than they should be. Adequate reports of research should clearly describe which questions were addressed and why, what was done, what was shown, and what the findings mean. However, substantial failures occur in each of these elements. For example, studies of published trial reports showed that the poor description of interventions meant that 40–89% were non-replicable; comparisons of protocols with publications showed that most studies had at least one primary outcome changed, introduced, or omitted; and investigators of new trials rarely set their findings in the context of a systematic review, and cited a very small and biased selection of previous relevant trials. Although best documented in reports of controlled trials, inadequate reporting occurs in all types of studies—animal and other preclinical studies, diagnostic studies, epidemiological studies, clinical prediction research, surveys, and qualitative studies. In this report, and in the Series more generally, we point to a waste at all stages in medical research. Although a more nuanced understanding of the complex systems involved in the conduct, writing, and publication of research is desirable, some immediate action can be taken to improve the reporting of research. Evidence for some recommendations is clear: change the current system of research rewards and regulations to encourage better and more complete reporting, and fund the development and maintenance of infrastructure to support better reporting, linkage, and archiving of all elements of research. However, the high amount of waste also warrants future investment in the monitoring of and research into reporting of research, and active implementation of the findings to ensure that research reports better address the needs of the range of research users.",
 				"issue": "9913",
 				"journalAbbreviation": "The Lancet",
-				"language": "en",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "267-276",
 				"publicationTitle": "The Lancet",
-				"url": "http://www.sciencedirect.com/science/article/pii/S014067361362228X",
+				"url": "https://www.sciencedirect.com/science/article/pii/S014067361362228X",
 				"volume": "383",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
 					},
 					{
 						"title": "ScienceDirect Full Text PDF",
-						"mimeType": "application/pdf"
+						"mimeType": "application/pdf",
+						"proxy": false
 					}
 				],
 				"tags": [],
@@ -915,25 +990,26 @@ var testCases = [
 						"creatorType": "author"
 					}
 				],
-				"date": "January 1, 1976",
+				"date": "1976-01-01",
 				"DOI": "10.1016/0584-8539(76)80131-6",
 				"ISSN": "0584-8539",
 				"abstractNote": "The absorption spectra between 400 and 50 cm−1 have been measured for the following compounds; 1,2-C6H4F2; 1,4-C6H4F2; 1,2,4-C6H3F3; 1,3,5-C6H3F3; 1,2,4,5-C6H2F4; 1,2,3,4-C6H2F4 (to 200 cm−1 only), 1,2,3,5,-C6H2F4; C6F5H and C6F6. Some new Raman data is also presented. Vibrational assignments have been criticallly examine by seeking consistency between assignments for different molecules and by comparison with predicted frequencies. There is clear evidence for a steady reduction in the force constant for the out-of-plane CH deformation with increasing fluorine substitution.",
 				"issue": "4",
 				"journalAbbreviation": "Spectrochimica Acta Part A: Molecular Spectroscopy",
-				"language": "en",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "663-672",
 				"publicationTitle": "Spectrochimica Acta Part A: Molecular Spectroscopy",
-				"url": "http://www.sciencedirect.com/science/article/pii/0584853976801316",
+				"url": "https://www.sciencedirect.com/science/article/pii/0584853976801316",
 				"volume": "32",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
 					},
 					{
 						"title": "ScienceDirect Full Text PDF",
-						"mimeType": "application/pdf"
+						"mimeType": "application/pdf",
+						"proxy": false
 					}
 				],
 				"tags": [],
@@ -944,7 +1020,7 @@ var testCases = [
 	},
 	{
 		"type": "web",
-		"url": "https://www.sciencedirect.com/science/article/pii/0022460X72904348",
+		"url": "https://www.sciencedirect.com/science/article/abs/pii/0022460X72904348",
 		"items": [
 			{
 				"itemType": "journalArticle",
@@ -956,25 +1032,26 @@ var testCases = [
 						"creatorType": "author"
 					}
 				],
-				"date": "November 22, 1972",
+				"date": "1972-11-22",
 				"DOI": "10.1016/0022-460X(72)90434-8",
 				"ISSN": "0022-460X",
 				"abstractNote": "The problem of estimating the modal density for flexurally vibrating plates and bars is approached by way of a travelling wave, rather than normal mode, decomposition. This viewpoint leads to simple expressions for modal densities in terms of the system geometry, surface wave velocity and a factor which is a function of the frequency-thickness product. Values of the multiplying factor are presented together with correction factors for existing thin-plate and thin-bar estimates. These factors are shown to involve only Poisson's ratio as a parameter, and to vary only slightly for a Poisson's ratio range of 0·25 to 0·35. The correction curve for plates is shown to be in general agreement with one proposed by Bolotin.",
 				"issue": "2",
 				"journalAbbreviation": "Journal of Sound and Vibration",
-				"language": "en",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "255-261",
 				"publicationTitle": "Journal of Sound and Vibration",
-				"url": "http://www.sciencedirect.com/science/article/pii/0022460X72904348",
+				"url": "https://www.sciencedirect.com/science/article/pii/0022460X72904348",
 				"volume": "25",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
 					},
 					{
 						"title": "ScienceDirect Full Text PDF",
-						"mimeType": "application/pdf"
+						"mimeType": "application/pdf",
+						"proxy": false
 					}
 				],
 				"tags": [],
@@ -1002,21 +1079,21 @@ var testCases = [
 						"creatorType": "author"
 					}
 				],
-				"date": "December 1, 2016",
+				"date": "2016-12-01",
 				"DOI": "10.1016/S2095-3119(16)61428-4",
 				"ISSN": "2095-3119",
 				"abstractNote": "The maintenance of rapid growth under conditions of CO2 enrichment is directly related to the capacity of new leaves to use or store the additional assimilated carbon (C) and nitrogen (N). Under drought conditions, however, less is known about C and N transport in C4 plants and the contributions of these processes to new foliar growth. We measured the patterns of C and N accumulation in maize (Zea mays L.) seedlings using 13C and 15N as tracers in CO2 climate chambers (380 or 750 μmol mol−1) under a mild drought stress induced with 10% PEG-6000. The drought stress under ambient conditions decreased the biomass production of the maize plants; however, this effect was reduced under elevated CO2. Compared with the water-stressed maize plants under atmospheric CO2, the treatment that combined elevated CO2 with water stress increased the accumulation of biomass, partitioned more C and N to new leaves as well as enhanced the carbon resource in ageing leaves and the carbon pool in new leaves. However, the C counterflow capability of the roots decreased. The elevated CO2 increased the time needed for newly acquired N to be present in the roots and increased the proportion of new N in the leaves. The maize plants supported the development of new leaves at elevated CO2 by altering the transport and remobilization of C and N. Under drought conditions, the increased activity of new leaves in relation to the storage of C and N sustained the enhanced growth of these plants under elevated CO2.",
 				"issue": "12",
 				"journalAbbreviation": "Journal of Integrative Agriculture",
-				"language": "en",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "2775-2785",
 				"publicationTitle": "Journal of Integrative Agriculture",
-				"url": "http://www.sciencedirect.com/science/article/pii/S2095311916614284",
+				"url": "https://www.sciencedirect.com/science/article/pii/S2095311916614284",
 				"volume": "15",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
 					},
 					{
 						"title": "ScienceDirect Full Text PDF",
@@ -1048,7 +1125,8 @@ var testCases = [
 	},
 	{
 		"type": "web",
-		"url": "http://www.sciencedirect.com/search?qs=zotero&show=25&sortBy=relevance",
+		"url": "https://www.sciencedirect.com/search?qs=zotero&show=25&sortBy=relevance",
+		"defer": true,
 		"items": "multiple"
 	},
 	{
@@ -1095,21 +1173,21 @@ var testCases = [
 						"creatorType": "author"
 					}
 				],
-				"date": "December 1, 2017",
+				"date": "2017-12-01",
 				"DOI": "10.1016/j.aipprr.2017.11.004",
 				"ISSN": "2007-4719",
 				"abstractNote": "Resumen\nEste trabajo buscó analizar si las variables memoria de trabajo (MT) verbal, MT visoespacial, velocidad de procesamiento y habilidad verbal pueden predecir la habilidad de los niños para el cálculo mental durante la realización de problemas aritméticos simples. Se administraron los subtests Vocabulario y Span de Dígitos del WISC-III; el subtest Casita de Animales del WPPSI-R y una prueba de problemas aritméticos (ad hoc) a 70 niños de 6 años. Un análisis de regresión lineal con el método stepwise mostró que solo la MT visoespacial predijo la variabilidad en las puntuaciones de cálculo mental (t=4.72; p<0.001; β=0.50). Los resultados son contrarios a estudios realizados en adultos y niños mayores en los cuales el mayor peso recae sobre la MT verbal. Es posible que a medida que los niños crecen la automatización de ciertos procesos de conteo y el almacenamiento de hechos aritméticos en la memoria de largo plazo produzca que dependan en mayor medida de la MT verbal para la resolución de este tipo de cálculos.\nThis study aimed to analyze whether verbal working memory (WM), visual-spatial WM, processing speed, and verbal ability predicted children's ability to perform mental arithmetic. Five tests were administered to 70 6-years-old children: the Vocabulary and Digits Span subtests from the WISC-III Intelligence Scale, the Animal Pegs subtest from WPPSI-R, and an arithmetic test (ad hoc). A linear regression analysis showed that only visual-spatial WM predicted the variability in children's scores in the arithmetic test (t=4.72; P<.001; β=.50). These findings contradict studies carried out in adults and older children where verbal WM seemed to play a greater role in the subject's ability to conduct calculations without external aids. It is possible that as they grow older, the automation of certain counting processes, as well as the storage and recovery of arithmetic knowledge from long-term memory will cause them to rely primarily on verbal WM resources.",
 				"issue": "3",
 				"journalAbbreviation": "Acta de Investigación Psicológica",
-				"language": "es",
 				"libraryCatalog": "ScienceDirect",
 				"pages": "2766-2774",
 				"publicationTitle": "Acta de Investigación Psicológica",
-				"url": "http://www.sciencedirect.com/science/article/pii/S2007471917300571",
+				"url": "https://www.sciencedirect.com/science/article/pii/S2007471917300571",
 				"volume": "7",
 				"attachments": [
 					{
-						"title": "ScienceDirect Snapshot"
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
 					},
 					{
 						"title": "ScienceDirect Full Text PDF",
@@ -1156,8 +1234,71 @@ var testCases = [
 	},
 	{
 		"type": "web",
-		"url": "https://www.sciencedirect.com/search/advanced?qs=testing",
+		"url": "https://www.sciencedirect.com/search?qs=testing",
+		"defer": true,
 		"items": "multiple"
+	},
+	{
+		"type": "web",
+		"url": "https://www.sciencedirect.com/science/article/pii/S0044848616303660",
+		"items": [
+			{
+				"itemType": "journalArticle",
+				"title": "Environmental and physiological factors shape the gut microbiota of Atlantic salmon parr (<i>Salmo salar</i> L.)",
+				"creators": [
+					{
+						"lastName": "Dehler",
+						"firstName": "Carola E.",
+						"creatorType": "author"
+					},
+					{
+						"lastName": "Secombes",
+						"firstName": "Christopher J.",
+						"creatorType": "author"
+					},
+					{
+						"lastName": "Martin",
+						"firstName": "Samuel A. M.",
+						"creatorType": "author"
+					}
+				],
+				"date": "2017-01-20",
+				"DOI": "10.1016/j.aquaculture.2016.07.017",
+				"ISSN": "0044-8486",
+				"abstractNote": "Gut microbes are key players in host immune system priming, protection and development, as well as providing nutrients to the host that would be otherwise unavailable. Due to this importance, studies investigating the link between host and microbe are being initiated in farmed fish. The establishment, maintenance and subsequent changes of the intestinal microbiota are central to define fish physiology and nutrition in the future. In fish, unlike mammals, acquiring intestinal microbes is believed to occur around the time of first feeding mainly from the water surrounding them and their microbial composition over time is shaped therefore by their habitat. Here we compare the distal intestine microbiota of Atlantic salmon parr reared in a recirculating laboratory aquarium with that of age matched parr maintained in cage culture in an open freshwater loch environment of a commercial fish farm to establish the microbial profiles in the gut at the freshwater stage and investigate if there is a stable subset of bacteria present regardless of habitat type. We used deep sequencing across two variable regions of the 16S rRNA gene, with a mean read depth of 180,144±12,096 raw sequences per sample. All individual fish used in this study had a minimum of 30,000 quality controlled reads, corresponding to an average of 342±19 Operational Taxonomic Units (OTUs) per sample, which predominantly mapped to the phyla Firmicutes, Proteobacteria, and Tenericutes. The results indicate that species richness is comparable between both treatment groups, however, significant differences were found in the compositions of the gut microbiota between the rearing groups. Furthermore, a core microbiota of 19OTUs was identified, shared by all samples regardless of treatment group, mainly consisting of members of the phyla Proteobacteria, Bacteroidetes and Firmicutes. Core microbiotas of the individual rearing groups were determined (aquarium fish: 19+4 (total 23) OTUs, loch fish: 19+13 (total 32) OTUs), indicating that microbe acquisition or loss is occurring differently in the two habitats, but also that selective forces are acting within the host, offering niches to specific bacterial taxa. The new information gathered in this study by the Illumina MiSeq approach will be useful to understand and define the gut microbiota of healthy Atlantic salmon in freshwater and expand on previous studies using DGGE, TGGE and T-RFPL. Monitoring deviations from these profiles, especially the core microbes which are present regardless of habitat type, might be used in the future as early indicator for intestinal health issues caused by sub optimal feed or infectious diseases in the farm setting.\nStatement of relevance\nThe Microbiome is central to gut health, local immune function and nutrient up take. We have used deep sequencing approach to show differences in rearing conditions of Atlantic salmon. This work is of interest to aquaculture nutritionists.",
+				"journalAbbreviation": "Aquaculture",
+				"libraryCatalog": "ScienceDirect",
+				"pages": "149-157",
+				"publicationTitle": "Aquaculture",
+				"series": "Cutting Edge Science in Aquaculture 2015",
+				"url": "https://www.sciencedirect.com/science/article/pii/S0044848616303660",
+				"volume": "467",
+				"attachments": [
+					{
+						"title": "ScienceDirect Snapshot",
+						"mimeType": "text/html"
+					},
+					{
+						"title": "ScienceDirect Full Text PDF",
+						"mimeType": "application/pdf",
+						"proxy": false
+					}
+				],
+				"tags": [
+					{
+						"tag": "Atlantic salmon"
+					},
+					{
+						"tag": "Gut microbiota"
+					},
+					{
+						"tag": "Next-generation sequencing"
+					}
+				],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
 	}
 ]
 /** END TEST CASES **/

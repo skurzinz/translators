@@ -9,13 +9,13 @@
 	"inRepository": true,
 	"translatorType": 4,
 	"browserSupport": "gcsibv",
-	"lastUpdated": "2020-05-17 15:09:25"
+	"lastUpdated": "2024-11-20 15:43:05"
 }
 
 /*
 	***** BEGIN LICENSE BLOCK *****
 
-	Copyright © 2016-2020 Sebastian Karcher
+	Copyright © 2016-2024 Sebastian Karcher
 
 	This file is part of Zotero.
 
@@ -36,6 +36,10 @@
 */
 
 function detectWeb(doc, url) {
+	// if one of these strings is in the URL, we're almost definitely on a listing
+	// page and should immediately return "multiple" if the page contains any
+	// results. the checks below (particularly url.includes('/books/')) might
+	// falsely return true and lead to an incorrect detection if we continue.
 	let multiples = /\/search\?|\/listing\?|\/issue\//;
 	if (multiples.test(url) && getSearchResults(doc, true)) {
 		return "multiple";
@@ -50,18 +54,25 @@ function detectWeb(doc, url) {
 		else return "book";
 	}
 
+	// now let's check for multiples again, just to be sure. this handles some
+	// rare listing page URLs that might not be included in the multiples
+	// regex above.
+	if (getSearchResults(doc, true)) {
+		return "multiple";
+	}
+
 	return false;
 }
 
 function getSearchResults(doc, checkOnly) {
 	var items = {};
 	var found = false;
-	var rows = ZU.xpath(doc,
-		'//li[@class="title"]//a[contains(@href, "/article/") or contains(@href, "/product/") or contains(@href, "/books/")]'
+	var rows = doc.querySelectorAll(
+		'li.title a[href*="/article/"], li.title a[href*="/product/"], li.title a[href*="/books/"], div.results .product-listing-with-inputs-content a[href*="/books/"]'
 	);
-	for (var i = 0; i < rows.length; i++) {
-		var href = rows[i].href;
-		var title = ZU.trimInternal(rows[i].textContent);
+	for (let row of rows) {
+		var href = row.href;
+		var title = ZU.trimInternal(row.textContent);
 		if (!href || !title) continue;
 		if (checkOnly) return true;
 		found = true;
@@ -71,28 +82,24 @@ function getSearchResults(doc, checkOnly) {
 }
 
 
-function doWeb(doc, url) {
-	if (detectWeb(doc, url) == "multiple") {
-		Zotero.selectItems(getSearchResults(doc, false), function (items) {
-			if (!items) {
-				return;
-			}
-			var articles = [];
-			for (let i in items) {
-				articles.push(i);
-			}
-			ZU.processDocuments(articles, scrape);
-		});
+async function doWeb(doc, url) {
+	if (detectWeb(doc, url) == 'multiple') {
+		let items = await Zotero.selectItems(getSearchResults(doc, false));
+		if (!items) return;
+		for (let url of Object.keys(items)) {
+			await scrape(await requestDocument(url));
+		}
 	}
 	else {
-		scrape(doc, url);
+		await scrape(doc, url);
 	}
 }
 
-function scrape(doc, url) {
+
+async function scrape(doc, url = doc.location.href) {
 	// Book metadata is much better using RIS
 	if (detectWeb(doc, url) == "book" || detectWeb(doc, url) == "bookSection") {
-		let productID = url.replace(/[#?].+/, "").match(/\/([^/]+)$/)[1];
+		let productID = url.replace(/[#?].*/, "").match(/\/([^/]+)$/)[1];
 		let risURL
 			= "/core/services/aop-easybib/export?exportType=ris&productIds="
 			+ productID + "&citationStyle=apa";
@@ -101,39 +108,43 @@ function scrape(doc, url) {
 		var pdfURL = ZU.xpathText(doc,
 			'//meta[contains(@name, "citation_pdf_url")]/@content'
 		);
+		if (!pdfURL) {
+			pdfURL = attr(doc, '.actions a[target="_blank"][href*=".pdf"]', 'href');
+		}
 		// Z.debug("pdfURL: " + pdfURL);
-		ZU.doGet(risURL, function (text) {
-			var translator = Zotero.loadTranslator(
-				"import");
-			translator.setTranslator(
-				"32d59d2d-b65a-4da4-b0a3-bdd3cfb979e7");
-			translator.setString(text);
-			translator.setHandler("itemDone", function (obj,
-				item) {
-				if (pdfURL) {
-					item.attachments.push({
-						url: pdfURL,
-						title: "Full Text PDF",
-						mimeType: "application/pdf"
-					});
-				}
+		var text = await requestText(risURL);
+		var translator = Zotero.loadTranslator(
+			"import");
+		translator.setTranslator(
+			"32d59d2d-b65a-4da4-b0a3-bdd3cfb979e7");
+		translator.setString(text);
+		translator.setHandler("itemDone", function (obj,
+			item) {
+			if (pdfURL) {
 				item.attachments.push({
-					title: "Snapshot",
-					document: doc
+					url: pdfURL,
+					title: "Full Text PDF",
+					mimeType: "application/pdf"
 				});
-				// don't save Cambridge Core to archive
-				item.archive = "";
-				item.complete();
+			}
+			item.attachments.push({
+				title: "Snapshot",
+				document: doc
 			});
-			translator.translate();
+			// don't save Cambridge Core to archive
+			item.archive = "";
+			item.complete();
 		});
+		await translator.translate();
 	}
 	// Some elements of journal citations look better with EM
 	else {
-		var translator = Zotero.loadTranslator('web');
+		let translator = Zotero.loadTranslator('web');
 		// Embedded Metadata
 		translator.setTranslator('951c027d-74ac-47d4-a107-9c3069ab7b48');
-		translator.setHandler('itemDone', function (obj, item) {
+		translator.setDocument(doc);
+		
+		translator.setHandler('itemDone', (_obj, item) => {
 			item.url = url;
 			var abstract = ZU.xpathText(doc,
 				'//div[@class="abstract"]');
@@ -141,19 +152,28 @@ function scrape(doc, url) {
 				item.abstractNote = abstract;
 			}
 			item.title = ZU.unescapeHTML(item.title);
+			item.publisher = ""; // don't grab the publisher
 			item.libraryCatalog = "Cambridge University Press";
+			if (item.date.includes("undefined")) {
+				item.date = attr('meta[name="citation_online_date"]', "content");
+			}
+			// remove asterisk or 1 at end of title, e.g. https://www.cambridge.org/core/journals/american-political-science-review/article/abs/violence-in-premodern-societies-rural-colombia/A14B0BB4130A2BA6BE79E2853597526E
+			const titleElem = doc.querySelector("#maincontent h1");
+			if (titleElem.querySelector('a:last-child')) {
+				item.title = titleElem.firstChild.textContent;
+			}
+
 			item.complete();
 		});
-
-		translator.getTranslatorObject(function (trans) {
-			if (url.includes("/books")) {
-				trans.itemType = "book";
-			}
-			else {
-				trans.itemType = "journalArticle";
-			}
-			trans.doWeb(doc, url);
-		});
+		let em = await translator.getTranslatorObject();
+		// TODO map additional meta tags here, or delete completely
+		if (url.includes("/books")) {
+			em.itemType = "book";
+		}
+		else {
+			em.itemType = "journalArticle";
+		}
+		await em.doWeb(doc, url);
 	}
 }
 
@@ -161,7 +181,7 @@ function scrape(doc, url) {
 var testCases = [
 	{
 		"type": "web",
-		"url": "https://www.cambridge.org/core/journals/journal-of-american-studies/article/samo-as-an-escape-clause-jean-michel-basquiats-engagement-with-a-commodified-american-africanism/1E4368D610A957B84F6DA3A58B8BF164",
+		"url": "https://www.cambridge.org/core/journals/journal-of-american-studies/article/abs/samo-as-an-escape-clause-jean-michel-basquiats-engagement-with-a-commodified-american-africanism/1E4368D610A957B84F6DA3A58B8BF164",
 		"items": [
 			{
 				"itemType": "journalArticle",
@@ -183,15 +203,12 @@ var testCases = [
 				"pages": "227-243",
 				"publicationTitle": "Journal of American Studies",
 				"shortTitle": "“SAMO© as an Escape Clause”",
-				"url": "https://www.cambridge.org/core/journals/journal-of-american-studies/article/samo-as-an-escape-clause-jean-michel-basquiats-engagement-with-a-commodified-american-africanism/1E4368D610A957B84F6DA3A58B8BF164",
+				"url": "https://www.cambridge.org/core/journals/journal-of-american-studies/article/abs/samo-as-an-escape-clause-jean-michel-basquiats-engagement-with-a-commodified-american-africanism/1E4368D610A957B84F6DA3A58B8BF164",
 				"volume": "45",
 				"attachments": [
 					{
 						"title": "Full Text PDF",
 						"mimeType": "application/pdf"
-					},
-					{
-						"title": "Snapshot"
 					}
 				],
 				"tags": [],
@@ -202,7 +219,7 @@ var testCases = [
 	},
 	{
 		"type": "web",
-		"url": "https://www.cambridge.org/core/journals/journal-of-fluid-mechanics/article/high-resolution-simulations-of-cylindrical-density-currents/30D62864BDED84A6CC81F5823950767B",
+		"url": "https://www.cambridge.org/core/journals/journal-of-fluid-mechanics/article/abs/high-resolution-simulations-of-cylindrical-density-currents/30D62864BDED84A6CC81F5823950767B",
 		"items": [
 			{
 				"itemType": "journalArticle",
@@ -232,15 +249,12 @@ var testCases = [
 				"libraryCatalog": "Cambridge University Press",
 				"pages": "437-469",
 				"publicationTitle": "Journal of Fluid Mechanics",
-				"url": "https://www.cambridge.org/core/journals/journal-of-fluid-mechanics/article/high-resolution-simulations-of-cylindrical-density-currents/30D62864BDED84A6CC81F5823950767B",
+				"url": "https://www.cambridge.org/core/journals/journal-of-fluid-mechanics/article/abs/high-resolution-simulations-of-cylindrical-density-currents/30D62864BDED84A6CC81F5823950767B",
 				"volume": "590",
 				"attachments": [
 					{
 						"title": "Full Text PDF",
 						"mimeType": "application/pdf"
-					},
-					{
-						"title": "Snapshot"
 					}
 				],
 				"tags": [
@@ -353,7 +367,8 @@ var testCases = [
 						"mimeType": "application/pdf"
 					},
 					{
-						"title": "Snapshot"
+						"title": "Snapshot",
+						"mimeType": "text/html"
 					}
 				],
 				"tags": [],
@@ -412,7 +427,8 @@ var testCases = [
 				"url": "https://www.cambridge.org/core/books/conservation-research-policy-and-practice/22AB241C45F182E40FC7F13637485D7E",
 				"attachments": [
 					{
-						"title": "Snapshot"
+						"title": "Snapshot",
+						"mimeType": "text/html"
 					}
 				],
 				"tags": [],
@@ -425,6 +441,140 @@ var testCases = [
 		"type": "web",
 		"url": "https://www.cambridge.org/core/what-we-publish/books/listing?sort=canonical.date%3Adesc&aggs%5BonlyShowAvailable%5D%5Bfilters%5D=true&aggs%5BproductTypes%5D%5Bfilters%5D=BOOK%2CELEMENT&searchWithinIds=0C5182F27A492FDC81EDF8D3C53266B5",
 		"items": "multiple"
+	},
+	{
+		"type": "web",
+		"url": "https://www.cambridge.org/core/journals/ajs-review/latest-issue",
+		"items": "multiple"
+	},
+	{
+		"type": "web",
+		"url": "https://www.cambridge.org/core/journals/american-political-science-review/article/abs/violence-in-premodern-societies-rural-colombia/A14B0BB4130A2BA6BE79E2853597526E",
+		"items": [
+			{
+				"itemType": "journalArticle",
+				"title": "Violence in Pre-Modern Societies: Rural Colombia",
+				"creators": [
+					{
+						"firstName": "Richard S.",
+						"lastName": "Weinert",
+						"creatorType": "author"
+					}
+				],
+				"date": "1966/06",
+				"DOI": "10.2307/1953360",
+				"ISSN": "0003-0554, 1537-5943",
+				"abstractNote": "Violence is a common phenomenon in developing polities which has received little attention. Clearly a Peronist riot in Buenos Aires, a land invasion in Lima, and a massacre in rural Colombia are all different. Yet we have no typology which relates types of violence to stages or patterns of economic or social development. We know little of the causes, incidence or functions of different forms of violence. This article is an effort to understand one type of violence which can occur in societies in transition.Violence in Colombia has traditionally accompanied transfers of power at the national level. This can account for its outbreak in 1946, when the Conservative Party replaced the Liberals. It cannot account for the intensity or duration of rural violence for two decades. This article focuses primarily on the violence from 1946 to 1953, and explains its intensification and duration as the defense of a traditional sacred order against secular modernizing tendencies undermining that order. We shall discuss violence since 1953 in the concluding section.",
+				"issue": "2",
+				"language": "en",
+				"libraryCatalog": "Cambridge University Press",
+				"pages": "340-347",
+				"publicationTitle": "American Political Science Review",
+				"shortTitle": "Violence in Pre-Modern Societies",
+				"url": "https://www.cambridge.org/core/journals/american-political-science-review/article/abs/violence-in-premodern-societies-rural-colombia/A14B0BB4130A2BA6BE79E2853597526E",
+				"volume": "60",
+				"attachments": [
+					{
+						"title": "Full Text PDF",
+						"mimeType": "application/pdf"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://www.cambridge.org/core/journals/journal-of-public-policy/article/abs/when-consumers-oppose-consumer-protection-the-politics-of-regulatory-backlash/2C8E6B9BB6881A233B8936D9AD2C6305",
+		"items": [
+			{
+				"itemType": "journalArticle",
+				"title": "When Consumers Oppose Consumer Protection: The Politics of Regulatory Backlash",
+				"creators": [
+					{
+						"firstName": "David",
+						"lastName": "Vogel",
+						"creatorType": "author"
+					}
+				],
+				"date": "1990/10",
+				"DOI": "10.1017/S0143814X00006085",
+				"ISSN": "1469-7815, 0143-814X",
+				"abstractNote": "This article examines a neglected phenomenon in the existing literature on social regulation, namely political opposition to regulation that comes not from business but from consumers. It examines four cases of successful grass-roots consumer opposition to government health and safety regulations in the United States. Two involve rules issued by the National Highway Traffic Safety Administration, a 1974 requirement that all new automobiles be equipped with an engine-interlock system, and a 1967 rule that denied federal highway funds to states that did not require motorcyclists to wear a helmet. In 1977, Congress overturned the Food and Drug Administration's ban on the artificial sweetener, saccharin. Beginning in 1987, the FDA began to yield to pressures from the gay community by agreeing to streamline its procedures for the testing and approval of new drugs designed to fight AIDS and other fatal diseases. The article identifies what these regulations have in common and examines their significance for our understanding the politics of social regulation in the United States and other industrial nations.",
+				"issue": "4",
+				"language": "en",
+				"libraryCatalog": "Cambridge University Press",
+				"pages": "449-470",
+				"publicationTitle": "Journal of Public Policy",
+				"shortTitle": "When Consumers Oppose Consumer Protection",
+				"url": "https://www.cambridge.org/core/journals/journal-of-public-policy/article/abs/when-consumers-oppose-consumer-protection-the-politics-of-regulatory-backlash/2C8E6B9BB6881A233B8936D9AD2C6305",
+				"volume": "10",
+				"attachments": [
+					{
+						"title": "Full Text PDF",
+						"mimeType": "application/pdf"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://www.cambridge.org/core/journals/american-political-science-review/firstview",
+		"items": "multiple"
+	},
+	{
+		"type": "web",
+		"url": "https://www.cambridge.org/core/books/foundations-of-probabilistic-programming/819623B1B5B33836476618AC0621F0EE",
+		"items": [
+			{
+				"itemType": "book",
+				"title": "Foundations of Probabilistic Programming",
+				"creators": [
+					{
+						"lastName": "Barthe",
+						"firstName": "Gilles",
+						"creatorType": "editor"
+					},
+					{
+						"lastName": "Katoen",
+						"firstName": "Joost-Pieter",
+						"creatorType": "editor"
+					},
+					{
+						"lastName": "Silva",
+						"firstName": "Alexandra",
+						"creatorType": "editor"
+					}
+				],
+				"date": "2020",
+				"ISBN": "9781108488518",
+				"abstractNote": "What does a probabilistic program actually compute? How can one formally reason about such probabilistic programs? This valuable guide covers such elementary questions and more. It provides a state-of-the-art overview of the theoretical underpinnings of modern probabilistic programming and their applications in machine learning, security, and other domains, at a level suitable for graduate students and non-experts in the field. In addition, the book treats the connection between probabilistic programs and mathematical logic, security (what is the probability that software leaks confidential information?), and presents three programming languages for different applications: Excel tables, program testing, and approximate computing. This title is also available as Open Access on Cambridge Core.",
+				"extra": "DOI: 10.1017/9781108770750",
+				"libraryCatalog": "Cambridge University Press",
+				"place": "Cambridge",
+				"publisher": "Cambridge University Press",
+				"url": "https://www.cambridge.org/core/books/foundations-of-probabilistic-programming/819623B1B5B33836476618AC0621F0EE",
+				"attachments": [
+					{
+						"title": "Full Text PDF",
+						"mimeType": "application/pdf"
+					},
+					{
+						"title": "Snapshot",
+						"mimeType": "text/html"
+					}
+				],
+				"tags": [],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
 	}
 ]
 /** END TEST CASES **/

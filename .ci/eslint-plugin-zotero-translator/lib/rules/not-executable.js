@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const translators = require('../translators').cache;
+const { parsed } = require('../../processor').support;
 
 module.exports = {
 	meta: {
@@ -17,11 +17,10 @@ module.exports = {
 	create: function (context) {
 		return {
 			Program: function (node) {
-				const translator = translators.get(context.getFilename());
-
-				if (!translator.source) return; // only check translators
+				if (process.platform == 'win32') return; // X_OK always succeeds on Windows
 
 				const filename = context.getFilename();
+				if (!parsed(filename)) return; // only check translators
 
 				try {
 					fs.accessSync(filename, fs.constants.X_OK);

@@ -1,14 +1,29 @@
 'use strict';
 
-const translators = require('../translators').cache;
-const astUtils = require("eslint/lib/util/ast-utils");
+const { parsed, json } = require('../../processor').support;
+
+function zip(arrays) {
+	let zipped = null;
+	for (const [key, array] of Object.entries(arrays)) {
+		if (!zipped) {
+			zipped = Array(array.length).fill(null).map((_, i) => ({ _: i }));
+		}
+		else if (array.length !== zipped.length) {
+			throw new Error(`Array length mismatch: ${key} has ${array.length} elements, but ${zipped.length} expected`);
+		}
+		for (const [i, value] of array.entries()) {
+			zipped[i][key] = value;
+		}
+	}
+	return zipped;
+}
 
 module.exports = {
 	meta: {
 		type: 'problem',
 
 		docs: {
-			description: 'disallow invalid test input',
+			description: 'disallow invalid tests',
 			category: 'Possible Errors',
 		},
 	},
@@ -16,79 +31,154 @@ module.exports = {
 	create: function (context) {
 		return {
 			Program: function (node) {
-				const translator = translators.get(context.getFilename());
+				const translator = parsed(context.getFilename());
+				if (!translator || !translator.testcases.text) return; // regular js source, or no testcases
 
-				const declaration = node.body.find(node => node.type === 'VariableDeclaration' && node.declarations.length === 1 && node.declarations[0].id.name === 'testCases');
-				const testCases = declaration
-					&& declaration.declarations[0].init
-					&& declaration.declarations[0].init.type === 'ArrayExpression'
-						? declaration.declarations[0].init.elements
-						: [];
-
-				if (declaration) {
-					const sourceCode = context.getSourceCode();
-					if (astUtils.isSemicolonToken(sourceCode.getLastToken(node))) {
-						context.report({
-							message: 'testcases should not have trailing semicolon',
-							loc: declaration.loc.end,
-						});
-					}
+				const err = json.try(translator.testcases.text, { line: translator.testcases.start, position: 3 });
+				if (err) {
+					context.report({
+						message: `Could not parse testcases: ${err.message}`,
+						loc: { start: { line: err.line, column: err.column } },
+					});
+					return;
 				}
 
-				if (!translator.testCases || translator.testCases.error) return; // regular js or no test cases
+				const declaration = node.body.find(node => (
+					node.type === 'VariableDeclaration'
+					&& node.declarations.length === 1
+					&& node.declarations[0].id.name === 'testCases'
+				));
+				if (declaration.followingStatement) {
+					context.report({
+						node: declaration.followingStatement,
+						message: 'testCases should not have trailing code',
+					});
+				}
 
-				let caseNo = -1;
-				for (const testCase of translator.testCases.parsed) {
-					caseNo += 1;
-					const prefix = `test case${testCases[caseNo] ? '' : ' ' + (caseNo + 1)}`;
-					const loc = testCases[caseNo] ? testCases[caseNo].loc.start : { start: { line: translator.testCases.start, column: 1 } };
+				const nodes = declaration.declarations[0].init.elements;
+				if (!Array.isArray(nodes)) {
+					context.report({
+						node: declaration,
+						message: 'testCases must be an array',
+					});
+					return;
+				}
 
+				const sourceCode = context.getSourceCode();
+				const token = sourceCode.getLastToken(node);
+				if (token.type === 'Punctuator' && token.value === ';') {
+					context.report({
+						message: 'testCases should not have trailing semicolon',
+						loc: declaration.loc.end,
+					});
+				}
+
+				zip({
+					testCase: JSON.parse(translator.testcases.text),
+					node: nodes,
+				})
+				.forEach(({ testCase, node }) => {
 					if (!['web', 'import', 'search'].includes(testCase.type)) {
 						context.report({
-							message: `${prefix} has invalid type "${testCase.type}"`,
-							loc,
+							node,
+							message: `test case has invalid type "${testCase.type}"`,
 						});
-						continue;
+						return;
 					}
 
 					if (!(Array.isArray(testCase.items) || (testCase.type === 'web' && testCase.items === 'multiple'))) {
 						context.report({
-							message: `${prefix} of type "${testCase.type}" needs items`,
-							loc,
+							node,
+							message: `test case of type "${testCase.type}" needs items`,
 						});
 					}
 
 					if (testCase.type === 'web' && typeof testCase.url !== 'string') {
 						context.report({
-							message: `${prefix} of type "${testCase.type}" test needs url`,
-							loc,
+							node,
+							message: `test case of type "${testCase.type}" test needs url`,
 						});
 					}
 
 					if (['import', 'search'].includes(testCase.type) && !testCase.input) {
 						context.report({
-							message: `${prefix} of type "${testCase.type}" needs a string input`,
-							loc,
+							node,
+							message: `test case of type "${testCase.type}" needs a string input`,
 						});
 					}
 					else if (testCase.type === 'import' && typeof testCase.input !== 'string') {
 						context.report({
-							message: `${prefix} of type "${testCase.type}" needs input`,
-							loc,
+							node,
+							message: `test case of type "${testCase.type}" needs input`,
 						});
 					}
 					else if (testCase.type === 'search') {
 						// console.log(JSON.stringify(testCase.input))
-						const term = Object.keys(testCase.input).join('/');
-						const expected = ['DOI', 'ISBN', 'PMID', 'identifiers', 'contextObject'];
-						if (!expected.includes(term)) {
+						const expected = ['DOI', 'ISBN', 'PMID', 'arXiv', 'identifiers', 'contextObject', 'adsBibcode', 'ericNumber', 'openAlex'];
+						let keys;
+						if (Array.isArray(testCase.input)) {
+							keys = testCase.input.flatMap(Object.keys);
+						}
+						else {
+							keys = Object.keys(testCase.input);
+						}
+						if (!keys.every(key => expected.includes(key))) {
+							const invalidKey = keys.find(key => !expected.includes(key));
 							context.report({
-								message: `${prefix} of type "${testCase.type}" has search term '${term}', expected one of ${expected.join(', ')}`,
-								loc,
+								node,
+								message: `test case of type "${testCase.type}" has invalid search term '${invalidKey}' - expected one of ${expected.join(', ')}`,
 							});
 						}
 					}
-				}
+
+					if (Array.isArray(testCase.items)) {
+						zip({
+							item: testCase.items,
+							node: node.properties.find(prop => prop.key.type === 'Literal' && prop.key.value === 'items').value.elements,
+						})
+						.forEach(({ item, node }) => {
+							if (!Array.isArray(item.creators)) {
+								context.report({
+									message: 'creators should be an array',
+									node,
+								});
+								return;
+							}
+
+							zip({
+								creator: item.creators,
+								node: node.properties.find(prop => prop.key.type === 'Literal' && prop.key.value === 'creators').value.elements,
+							})
+							.forEach(({ creator, node }) => {
+								if (creator.fieldMode !== undefined && creator.fieldMode !== 1) {
+									context.report({
+										node,
+										message: 'creator.fieldMode should be omitted or 1',
+									});
+								}
+								else if (creator.fieldMode === 1 && (creator.firstName || !creator.lastName)) {
+									context.report({
+										node,
+										message: 'creator with fieldMode == 1 should have lastName and no firstName',
+									});
+								}
+								else if (!creator.firstName && !creator.lastName) {
+									context.report({
+										node,
+										message: 'creator has no name',
+									});
+								}
+
+								if (!creator.creatorType) {
+									context.report({
+										node,
+										message: 'creator has no creatorType',
+									});
+								}
+							});
+						});
+					}
+				});
 			}
 		};
 	},

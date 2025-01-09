@@ -2,16 +2,15 @@
 	"translatorID": "27ee5b2c-2a5a-4afc-a0aa-d386642d4eed",
 	"label": "PubMed Central",
 	"creator": "Michael Berkowitz and Rintze Zelle",
-	"target": "^https://(www\\.)?ncbi\\.nlm\\.nih\\.gov/pmc",
+	"target": "^https://(www\\.)?(pmc\\.ncbi\\.nlm\\.nih\\.gov/|ncbi\\.nlm\\.nih\\.gov/pmc)",
 	"minVersion": "3.0",
 	"maxVersion": "",
 	"priority": 100,
 	"inRepository": true,
 	"translatorType": 4,
 	"browserSupport": "gcsibv",
-	"lastUpdated": "2019-04-07 17:23:07"
+	"lastUpdated": "2024-11-21 21:03:01"
 }
-
 
 /*
 	***** BEGIN LICENSE BLOCK *****
@@ -37,7 +36,10 @@
 */
 
 function detectWeb(doc, url) {
-	if (getPMCID(url)) {
+	// Make sure the page have a PMCID and we're on a valid item page,
+	// or looking at a PDF
+	if (getPMCID(url) && (url.includes(".pdf")
+	|| 	doc.getElementsByClassName('pmc-header').length)) {
 		return "journalArticle";
 	}
 	
@@ -67,9 +69,12 @@ function doWeb(doc, url) {
 		var pmcid = getPMCID(url);
 		var pdf = getPDF(doc, '//td[@class="format-menu"]//a[contains(@href,".pdf")]'
 				+ '|//div[@class="format-menu"]//a[contains(@href,".pdf")]'
-				+ '|//aside[@id="jr-alt-p"]/div/a[contains(@href,".pdf")]');
+				+ '|//aside[@id="jr-alt-p"]/div/a[contains(@href,".pdf")]'
+				+ '|//li[contains(@class, "pdf-link")]/a'
+				+ '|//a[contains(@data-ga-label, "pdf_download_")]');
+		// Z.debug(pdf);
 		// if we're looking at a pdf, just use the current url
-		if (!pdf && url.search(/\/pdf\/.+.pdf/) != -1) {
+		if (!pdf && /\/pdf\/.+.pdf/.test(url)) {
 			pdf = url;
 		}
 		var pdfCollection = {};
@@ -136,6 +141,13 @@ function lookupPMCIDs(ids, doc, pdfLink) {
 
 		var articles = ZU.xpath(doc, '/pmcarticleset/article');
 
+		if (!articles.length) {
+			let error = ZU.xpathText(doc, '/pmcarticleset/error/Message');
+			if (error) {
+				throw new Error(`PMC returned error: ${error}`);
+			}
+		}
+
 		for (var i in articles) {
 			var newItem = new Zotero.Item("journalArticle");
 			
@@ -192,6 +204,11 @@ function lookupPMCIDs(ids, doc, pdfLink) {
 			else if (firstPage) {
 				newItem.pages = firstPage;
 			}
+			// use elocationid where we don't have itemIDs
+			if (!newItem.pages) {
+				newItem.pages = ZU.xpathText(article, 'elocationid');
+			}
+			
 
 			var pubDate = ZU.xpath(article, 'pubdate[@pubtype="ppub"]');
 			if (!pubDate.length) {
@@ -343,11 +360,6 @@ var testCases = [
 	},
 	{
 		"type": "web",
-		"url": "https://www.ncbi.nlm.nih.gov/pmc/issues/184700/",
-		"items": "multiple"
-	},
-	{
-		"type": "web",
 		"url": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3139813/?report=classic",
 		"items": [
 			{
@@ -476,6 +488,7 @@ var testCases = [
 				"issue": "1",
 				"journalAbbreviation": "PLoS One",
 				"libraryCatalog": "PubMed Central",
+				"pages": "e8653",
 				"publicationTitle": "PLoS ONE",
 				"url": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2801612/",
 				"volume": "5",

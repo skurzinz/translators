@@ -8,8 +8,8 @@
 	"priority": 100,
 	"inRepository": true,
 	"translatorType": 4,
-	"browserSupport": "gcsbv",
-	"lastUpdated": "2020-03-09 18:50:52"
+	"browserSupport": "gcsibv",
+	"lastUpdated": "2024-07-14 15:27:57"
 }
 
 /*
@@ -46,31 +46,28 @@ function detectWeb(doc, url) {
 	return false;
 }
 
-function doWeb(doc, url) {
-	var articles = [];
+async function doWeb(doc, url) {
 	if (detectWeb(doc, url) == "multiple") {
 		var results = ZU.xpath(doc, '//table[@id="restab"]/tbody/tr[starts-with(@id, "arw")]/td[2]');
 		// Zotero.debug('results.length: ' + results.length);
 		var items = {};
 		for (let i = 0; i < results.length; i++) {
 			// Zotero.debug('result [' + i + '] text: ' + results[i].textContent);
-			var title = ZU.xpathText(results[i], './a');
-			var uri = ZU.xpathText(results[i], ' ./a/@href');
+			var title = ZU.xpathText(results[i], './/a');
+			var uri = ZU.xpathText(results[i], ' .//a/@href');
 			if (!title || !uri) continue;
 			items[uri] = fixCasing(title);
 		}
-		Zotero.selectItems(items, function (items) {
-			if (!items) {
-				return;
-			}
-			for (let i in items) {
-				articles.push(i);
-			}
-			Zotero.Utilities.processDocuments(articles, scrape);
-		});
+		items = await Zotero.selectItems(items);
+		if (!items) {
+			return;
+		}
+		for (let url of Object.keys(items)) {
+			await scrape(await requestDocument(url));
+		}
 	}
 	else {
-		scrape(doc, url);
+		await scrape(doc, url);
 	}
 }
 
@@ -91,17 +88,18 @@ function getDocType(doc) {
 		case "научная статья":
 		case "статья в журнале":
 		case "статья в открытом архиве":
+		case "сборник трудов конференции":
+		case "статья в журнале - разное":
 			itemType = "journalArticle";
 			break;
 		case "статья в сборнике трудов конференции":
+		case "публикация в сборнике трудов конференции":
+		case "тезисы доклада на конференции":
 			itemType = "conferencePaper";
 			break;
 		case "учебное пособие":
 		case "монография":
 			itemType = "book";
-			break;
-		case "публикация в сборнике трудов конференции":
-			itemType = "conferencePaper";
 			break;
 		default:
 			Zotero.debug("Unknown type: " + docType + ". Using 'journalArticle'");
@@ -111,7 +109,29 @@ function getDocType(doc) {
 	return itemType;
 }
 
-function scrape(doc, url) {
+async function scrape(doc, url = doc.location.href) {
+	if (doc.querySelector('.help.pointer') && !doc.querySelector('.help.pointer[title]')) {
+		// Full author names are in the HTML at page load but are stripped and replaced with
+		// JS tooltips. Try to reload the page and see if we can get the tooltips. If we
+		// still get a page without tooltips, we might've hit a captcha (seems to commonly
+		// happen when requesting from a US IP), so don't worry about it.
+		Zotero.debug('Re-requesting to get original HTML');
+		try {
+			let newDoc = await requestDocument(url, {
+				headers: { Referer: url }
+			});
+			if (newDoc.querySelector('.help.pointer[title]')) {
+				doc = newDoc;
+			}
+			else {
+				Zotero.debug('Hit a captcha? ' + newDoc.location.href);
+			}
+		}
+		catch (e) {
+			Zotero.debug('Failed: ' + e);
+		}
+	}
+
 	var item = new Zotero.Item();
 	item.itemType = getDocType(doc);
 	item.title = fixCasing(doc.title);
@@ -119,31 +139,52 @@ function scrape(doc, url) {
 	
 	var rightPart = doc.getElementById("leftcol").nextSibling;
 	var centralColumn = ZU.xpath(rightPart, './table/tbody/tr[2]/td[@align="left"]');
-	var datablock = ZU.xpath(centralColumn, './div[1]');
+	var datablock = ZU.xpath(centralColumn, './div[2]');
 	
-	var authors = ZU.xpath(datablock, './/table[1]//b');
+	var authors = ZU.xpath(datablock, './/table[1]/tbody/tr/td[2]//b');
 	// Zotero.debug('authors.length: ' + authors.length);
 	
-	for (let i = 0; i < authors.length; i++) {
-		var dirty = authors[i].textContent;
+	for (let author of authors) {
+		let dirty = author.textContent;
+		try {
+			let tooltipParent = author.closest('.help.pointer[title]');
+			if (tooltipParent) {
+				let tooltipHTML = tooltipParent.getAttribute('title');
+				let tooltipAuthorName = text(new DOMParser().parseFromString(tooltipHTML, 'text/html'), 'font');
+				if (tooltipAuthorName) {
+					dirty = tooltipAuthorName;
+				}
+			}
+		}
+		catch (e) {
+			Zotero.debug(e);
+		}
+
 		// Zotero.debug('author[' + i + '] text: ' + dirty);
 		
 		/* Common author field formats are:
 			(1) "LAST FIRST PATRONIMIC"
 			(2) "LAST F. P." || "LAST F.P." || "LAST F.P" || "LAST F."
+			(3) "LAST (MAIDEN) FIRST PATRONYMIC"
 			
 		   In all these cases, we put comma after LAST for `ZU.cleanAuthor()` to work.
 		   Other formats are rare, but possible, e.g. "ВАН ДЕ КЕРЧОВЕ Р." == "Van de Kerchove R.".
 		   They go to single-field mode (assuming they got no comma). */
 		var nameFormat1RE = new ZU.XRegExp("^\\p{Letter}+\\s\\p{Letter}+\\s\\p{Letter}+$");
 		var nameFormat2RE = new ZU.XRegExp("^\\p{Letter}+\\s\\p{Letter}\\.(\\s?\\p{Letter}\\.?)?$");
-		
+		var nameFormat3RE = new ZU.XRegExp("^\\p{Letter}+\\s\\(\\p{Letter}+\\)\\s\\p{Letter}+\\s\\p{Letter}+$");
+
 		var isFormat1 = ZU.XRegExp.test(dirty, nameFormat1RE);
 		var isFormat2 = ZU.XRegExp.test(dirty, nameFormat2RE);
+		var isFormat3 = ZU.XRegExp.test(dirty, nameFormat3RE);
 		
 		if (isFormat1 || isFormat2) {
 			// add comma before the first space
 			dirty = dirty.replace(/^([^\s]*)(\s)/, '$1, ');
+		}
+		else if (isFormat3) {
+			// add comma after the parenthesized maiden name
+			dirty = dirty.replace(/^(.+\))(\s)/, '$1, ');
 		}
 		
 		var cleaned = ZU.cleanAuthor(dirty, "author", true);
@@ -156,19 +197,19 @@ function scrape(doc, url) {
 		   for example, "S. V." -> "S. v.", but "S. K." -> "S. K.".
 		   Thus, we can only apply it to Format1 . */
 		
-		if (isFormat1) {
+		if (isFormat1 || isFormat3) {
 			// "FIRST PATRONIMIC" -> "First Patronimic"
 			cleaned.firstName = fixCasing(cleaned.firstName);
 		}
 		
 		if (cleaned.firstName === undefined) {
 			// Unable to parse. Restore punctuation.
-			cleaned.fieldMode = true;
+			cleaned.fieldMode = 1;
 			cleaned.lastName = dirty;
 		}
 		
-		cleaned.lastName = fixCasing(cleaned.lastName, true);
-		
+		cleaned.lastName = fixCasing(cleaned.lastName);
+
 		// Skip entries with an @ sign-- email addresses slip in otherwise
 		if (!cleaned.lastName.includes("@")) item.creators.push(cleaned);
 	}
@@ -182,7 +223,7 @@ function scrape(doc, url) {
 		Номер: "issue",
 		ISSN: "ISSN",
 		"Число страниц": "pages", // e.g. "83"
-		Страницы: "pages", // e.g. "10-16"
+		Страницы: "pages",
 		Язык: "language",
 		"Место издания": "place"
 	};
@@ -194,6 +235,9 @@ function scrape(doc, url) {
 			item[mapping[key]] = t;
 		}
 	}
+
+	var pages = ZU.xpathText(datablock, '//tr/td/div/text()[contains(., "Страницы")]/following-sibling::*[1]');
+	if (pages) item.pages = pages;
 	
 	/*
 	// Times-cited in Russian-Science-Citation-Index.
@@ -202,6 +246,8 @@ function scrape(doc, url) {
 	var rsci = ZU.xpathText(doc, '//tr/td/text()[contains(., "Цитирований в РИНЦ")]/following-sibling::*[2]');
 	Zotero.debug("Russian Science Citation Index: " + rsci);
 	if (rsci) item.extra = "Цитируемость в РИНЦ: " + rsci;
+
+
 	*/
 
 	var journalBlock = ZU.xpath(datablock, './table/tbody[tr[1]/td/font[contains(text(), "ЖУРНАЛ:")]]/tr[2]/td[2]');
@@ -251,7 +297,6 @@ function scrape(doc, url) {
 	item.complete();
 }
 
-
 /** BEGIN TEST CASES **/
 var testCases = [
 	{
@@ -265,7 +310,7 @@ var testCases = [
 		"items": [
 			{
 				"itemType": "journalArticle",
-				"title": "Иноязычные заимствования в художественной прозе на иврите в XX в",
+				"title": "Иноязычные заимствования в художественной прозе на иврите в XX в.",
 				"creators": [
 					{
 						"firstName": "М. В.",
@@ -290,7 +335,7 @@ var testCases = [
 	},
 	{
 		"type": "web",
-		"url": "https://elibrary.ru/item.asp?id=17339044",
+		"url": "https://www.elibrary.ru/item.asp?id=17339044",
 		"items": [
 			{
 				"itemType": "journalArticle",
@@ -303,7 +348,7 @@ var testCases = [
 					},
 					{
 						"firstName": "Елена Владимировна",
-						"lastName": "Ульяновская",
+						"lastName": "Ульяновская (Колосова)",
 						"creatorType": "author"
 					},
 					{
@@ -330,21 +375,9 @@ var testCases = [
 				"libraryCatalog": "eLibrary.ru",
 				"pages": "1-10",
 				"publicationTitle": "Плодоводство И Виноградарство Юга России",
-				"url": "https://elibrary.ru/item.asp?id=17339044",
+				"url": "https://www.elibrary.ru/item.asp?id=17339044",
 				"attachments": [],
 				"tags": [
-					{
-						"tag": "Apple-Tree"
-					},
-					{
-						"tag": "Immunity"
-					},
-					{
-						"tag": "Scab"
-					},
-					{
-						"tag": "Variety"
-					},
 					{
 						"tag": "Иммунитет"
 					},
@@ -372,22 +405,22 @@ var testCases = [
 				"title": "На пути к верификации C программ. Часть 3. Перевод из языка C-light в язык C-light-kernel и его формальное обоснование",
 				"creators": [
 					{
-						"firstName": "В. А.",
+						"firstName": "Валерий Александрович",
 						"lastName": "Непомнящий",
 						"creatorType": "author"
 					},
 					{
-						"firstName": "И. С.",
+						"firstName": "Игорь Сергеевич",
 						"lastName": "Ануреев",
 						"creatorType": "author"
 					},
 					{
-						"firstName": "И. Н.",
+						"firstName": "Иван Николаевич",
 						"lastName": "Михайлов",
 						"creatorType": "author"
 					},
 					{
-						"firstName": "А. В.",
+						"firstName": "Алексей Владимирович",
 						"lastName": "Промский",
 						"creatorType": "author"
 					}
@@ -415,7 +448,7 @@ var testCases = [
 				"title": "Информационно-поисковая полнотекстовая система \"Боярские списки XVIII века\"",
 				"creators": [
 					{
-						"firstName": "А. В.",
+						"firstName": "Андрей Викторович",
 						"lastName": "Захаров",
 						"creatorType": "author"
 					}
@@ -475,7 +508,7 @@ var testCases = [
 						"creatorType": "author"
 					},
 					{
-						"firstName": "А. В.",
+						"firstName": "Александр Викторович",
 						"lastName": "Хохлов",
 						"creatorType": "author"
 					}
@@ -537,7 +570,7 @@ var testCases = [
 				"title": "Графики негладких контактных отображений на группах карно с сублоренцевой структурой",
 				"creators": [
 					{
-						"firstName": "М. Б.",
+						"firstName": "Мария Борисовна",
 						"lastName": "Карманова",
 						"creatorType": "author"
 					}
@@ -545,7 +578,7 @@ var testCases = [
 				"date": "2019",
 				"DOI": "10.31857/S0869-56524863275-279",
 				"ISSN": "0869-5652",
-				"abstractNote": "Для классов графиков -отображений нильпотентных градуированных групп доказана формула площади на сублоренцевых структурах произвольной глубины с многомерным временем.",
+				"abstractNote": "Для классов графиков - отображений нильпотентных градуированных групп доказана формула площади на сублоренцевых структурах произвольной глубины с многомерным временем.",
 				"issue": "3",
 				"language": "ru",
 				"libraryCatalog": "eLibrary.ru",
@@ -555,27 +588,6 @@ var testCases = [
 				"volume": "486",
 				"attachments": [],
 				"tags": [
-					{
-						"tag": "Contact Mapping"
-					},
-					{
-						"tag": "Graph-Mapping"
-					},
-					{
-						"tag": "Intrinsic Basis"
-					},
-					{
-						"tag": "Multidimensional Time"
-					},
-					{
-						"tag": "Nilpotent Graded Group"
-					},
-					{
-						"tag": "Sub-Lorentzian Structure"
-					},
-					{
-						"tag": "Surface Area"
-					},
 					{
 						"tag": "Внутренний Базис"
 					},
@@ -671,22 +683,22 @@ var testCases = [
 					{
 						"lastName": "Де Щулф А.",
 						"creatorType": "author",
-						"fieldMode": true
+						"fieldMode": 1
 					},
 					{
-						"firstName": "Е.",
+						"firstName": "Эдуард Павлович",
 						"lastName": "Дворников",
 						"creatorType": "author"
 					},
 					{
-						"firstName": "А. В.",
-						"lastName": "Ебел",
+						"firstName": "Александр Викторович",
+						"lastName": "Эбель",
 						"creatorType": "author"
 					},
 					{
 						"lastName": "Ван Хооф Л.",
 						"creatorType": "author",
-						"fieldMode": true
+						"fieldMode": 1
 					},
 					{
 						"firstName": "С.",
@@ -696,7 +708,7 @@ var testCases = [
 					{
 						"lastName": "Де Лангхе К.",
 						"creatorType": "author",
-						"fieldMode": true
+						"fieldMode": 1
 					},
 					{
 						"firstName": "А.",
@@ -706,7 +718,7 @@ var testCases = [
 					{
 						"lastName": "Ван Де Керчове Р.",
 						"creatorType": "author",
-						"fieldMode": true
+						"fieldMode": 1
 					},
 					{
 						"firstName": "Р.",
@@ -716,7 +728,7 @@ var testCases = [
 					{
 						"lastName": "Те Киефте Д.",
 						"creatorType": "author",
-						"fieldMode": true
+						"fieldMode": 1
 					}
 				],
 				"date": "2009",
@@ -730,18 +742,6 @@ var testCases = [
 				"attachments": [],
 				"tags": [
 					{
-						"tag": "Belgian-Russian Expedition"
-					},
-					{
-						"tag": "Karakol"
-					},
-					{
-						"tag": "Scythian Culture"
-					},
-					{
-						"tag": "Uch Enmek Park"
-					},
-					{
 						"tag": "Бельгийско-Русская Экспедиция"
 					},
 					{
@@ -752,6 +752,110 @@ var testCases = [
 					},
 					{
 						"tag": "Скифская Культура"
+					}
+				],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://elibrary.ru/item.asp?id=22208210",
+		"items": [
+			{
+				"itemType": "journalArticle",
+				"title": "Biological and cognitive correlates of murder and attempted murder in the italian regions",
+				"creators": [
+					{
+						"firstName": "D. I.",
+						"lastName": "Templer",
+						"creatorType": "author"
+					}
+				],
+				"date": "2013",
+				"ISSN": "0025-2344",
+				"abstractNote": "The present study extends the findings of Lynn (2010), who reported higher mean IQ in northern than southern Italy and of Templer (2012), who found biological correlates of IQ in the Italian regions. The present study found that murder and attempted murder rates were associated with Mediterranean/Mideastern characteristics (lower IQ, black hair, black eyes) and that lower murder rates were associated with central/northern European characteristics (higher cephalic index, blond hair, blue eyes, and higher multiple sclerosis and schizophrenia rates). The eye and hair color findings are consistent with the human and animal literature finding of darker coloration associated with greater aggression. © Copyright 2013.",
+				"issue": "1",
+				"language": "en",
+				"libraryCatalog": "eLibrary.ru",
+				"pages": "26-48",
+				"publicationTitle": "Mankind Quarterly",
+				"url": "https://elibrary.ru/item.asp?id=22208210",
+				"volume": "54",
+				"attachments": [],
+				"tags": [
+					{
+						"tag": "Eye Color"
+					},
+					{
+						"tag": "Hair Color"
+					},
+					{
+						"tag": "Iq"
+					},
+					{
+						"tag": "Italy"
+					},
+					{
+						"tag": "Murder"
+					}
+				],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "web",
+		"url": "https://elibrary.ru/item.asp?id=35209757",
+		"items": [
+			{
+				"itemType": "journalArticle",
+				"title": "Факторы Патогенности Недифтерийных Коринебактерий, Выделенных От Больных С Патологией Респираторного Тракта",
+				"creators": [
+					{
+						"firstName": "Анна Александровна",
+						"lastName": "Алиева (Чепурова)",
+						"creatorType": "author"
+					},
+					{
+						"firstName": "Галина Георгиевна",
+						"lastName": "Харсеева",
+						"creatorType": "author"
+					},
+					{
+						"firstName": "Эрдем Очанович",
+						"lastName": "Мангутов",
+						"creatorType": "author"
+					},
+					{
+						"firstName": "Сергей Николаевич",
+						"lastName": "Головин",
+						"creatorType": "author"
+					}
+				],
+				"date": "2018",
+				"DOI": "10.18821/0869-2084-2018-63-6-375-378",
+				"ISSN": "0869-2084, 2412-1320",
+				"abstractNote": "Недифтерийные коринебактерии штаммов C. pseudodiphtheriticum, несмотря на отсутствие способности продуцировать токсин, могут быть связаны с развитием воспалительных заболеваний респираторного и урогенитального тракта, кожи, гнойно-септических процессов различной локализации и др. Это свидетельствует о наличии у них факторов патогенности, помимо токсина, которые могут обусловливать адгезивную и инвазивную активность. Цель исследования - характеристика факторов патогенности (адгезивности, инвазивности) недифтерийных коринебактерий, выделенных от больных с патологией респираторного тракта. Исследованы штаммы недифтерийных коринебактерий (n = 38), выделенные из верхних дыхательных путей от больных с хроническим тонзиллитом (C. pseudodiphtheriticum, n = 9 ), ангинами (C. pseudodiphtheriticum, n = 14), практически здоровых обследованных (C. Pseudodiphtheriticum, n = 15). Способность к адгезии и инвазии коринебактерий исследовали на культуре клеток карциномы фарингеального эпителия Hep-2...\n\nНедифтерийные коринебактерии штаммов C. pseudodiphtheriticum, несмотря на отсутствие способности продуцировать токсин, могут быть связаны с развитием воспалительных заболеваний респираторного и урогенитального тракта, кожи, гнойно-септических процессов различной локализации и др. Это свидетельствует о наличии у них факторов патогенности, помимо токсина, которые могут обусловливать адгезивную и инвазивную активность. Цель исследования - характеристика факторов патогенности (адгезивности, инвазивности) недифтерийных коринебактерий, выделенных от больных с патологией респираторного тракта. Исследованы штаммы недифтерийных коринебактерий (n = 38), выделенные из верхних дыхательных путей от больных с хроническим тонзиллитом (C. pseudodiphtheriticum, n = 9 ), ангинами (C. pseudodiphtheriticum, n = 14), практически здоровых обследованных (C. Pseudodiphtheriticum, n = 15). Способность к адгезии и инвазии коринебактерий исследовали на культуре клеток карциномы фарингеального эпителия Hep-2. Количество коринебактерий, адгезированных и инвазированных на клетках Нер-2, определяли путём высева смыва на 20%-ный сывороточный агар с последующим подсчётом среднего количества колониеобразующих единиц (КОЕ) в 1 мл. Электронно-микроскопическое исследование адгезии и инвазии коринебактерий на культуре клеток Нер-2 проводили методом трансмиссионной электронной микроскопии. У выделенных от практически здоровых лиц штаммов C. pseudodiphtheriticum адгезивность была ниже (р ≤ 0,05), чем у всех исследованных штаммов недифтерийных коринебактерий, выделенных от больных с патологией респираторного тракта. Наиболее выраженные адгезивные свойства (238,3 ± 6,5 КОЕ/мл) обнаружены у штаммов C. pseudodiphtheriticum, выделенных от больных ангинами, по сравнению с таковыми, выделенными от больных хроническим тонзиллитом. Адгезивность и инвазивность у всех исследованных штаммов имели положительную коррелятивную связь. При электронно-микроскопическом исследовании видны коринебактерии, как адгезированные на поверхности клеток Нер-2 и накопившие контрастное вещество, так и инвазированные, электронно-прозрачные. Недифтерийные коринебактерии штаммов С. pseudodiphtheriticum, выделенных от больных с патологией респираторного тракта (ангина, хронический тонзиллит), обладали более высокой способностью к адгезии и инвазии по сравнению со штаммами С. pseudodiphtheriticum, изолированными от практически здоровых лиц. Выраженная способность к адгезии и инвазии, рассматриваемым как факторы патогенности С.pseudodiphtheriticum, позволяет им реализовывать свой патогенный потенциал, защищая от действия иммунной системы хозяина и антибактериальных препаратов.\n\nfunction show_abstract() {\n  $('#abstract1').hide();\n  $('#abstract2').show();\n  $('#abstract_expand').hide();\n}\n\n▼Показать полностью",
+				"issue": "6",
+				"language": "ru",
+				"libraryCatalog": "eLibrary.ru",
+				"pages": "375-378",
+				"publicationTitle": "Клиническая Лабораторная Диагностика",
+				"url": "https://elibrary.ru/item.asp?id=35209757",
+				"volume": "63",
+				"attachments": [],
+				"tags": [
+					{
+						"tag": "Адгезия"
+					},
+					{
+						"tag": "Инвазия"
+					},
+					{
+						"tag": "Факторы Патогенности"
 					}
 				],
 				"notes": [],

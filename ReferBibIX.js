@@ -11,9 +11,8 @@
 	},
 	"inRepository": true,
 	"translatorType": 3,
-	"lastUpdated": "2019-08-07 11:11:24"
+	"lastUpdated": "2023-10-27 09:03:42"
 }
-
 
 function detectImport() {
 	var lineRe = /%[A-Z0-9*$] .+/;
@@ -105,6 +104,7 @@ var typeMap = {
 // TODO: BILL, CASE, COMP, CONF, DATA, HEAR, MUSIC, PAT, SOUND, STAT
 var inputTypeMap = {
 	"Ancient Text": "book",
+	Audio: "audioRecording",
 	"Audiovisual Material": "videoRecording",
 	Generic: "book",
 	"Chart or Table": "artwork",
@@ -148,8 +148,6 @@ function processTag(item, tag, value) {
 					break;
 				}
 			}
-			// fall back to generic
-			if (!item.itemType) item.itemType = inputTypeMap.Generic;
 		}
 	}
 	else if (tag == "A" || tag == "E" || tag == "Y") {
@@ -209,12 +207,13 @@ function doImport() {
 	var line = true;
 	var tag = data = false;
 	do {	// first valid line is type
-		Zotero.debug("ignoring " + line);
+		if (line !== true) Zotero.debug("ignoring " + line);
 		line = Zotero.read();
 		line = line.replace(/^\s+/, "");
 	} while (line !== false && line[0] != "%");
-	
-	var item = new Zotero.Item();
+
+	// default to creating a book if no %0 tag is eventually found
+	var item = new Zotero.Item(inputTypeMap.Generic);
 	
 	tag = line[1];
 	var data = line.substr(3);
@@ -227,7 +226,7 @@ function doImport() {
 				tag = data = false;
 				// new item
 				item.complete();
-				item = new Zotero.Item();
+				item = new Zotero.Item(inputTypeMap.Generic);
 			}
 		}
 		else if (line[0] == "%" && line[2] == " ") {
@@ -403,6 +402,59 @@ var testCases = [
 						"note": "Elektronisk reproduksjon [Norge] Nasjonalbiblioteket Digital 2016-11-03"
 					}
 				],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "import",
+		"input": "%T Corn\n%A Newman, W. H.\n%I Uniontown, Ala. : Canebrake Agricultural Experiment Station\n%D 1891\n%K Corn -- Yields\n%K Corn -- Varieties\n%K Corn -- Field experiments\n\n",
+		"items": [
+			{
+				"itemType": "book",
+				"title": "Corn",
+				"creators": [
+					{
+						"firstName": "W. H.",
+						"lastName": "Newman",
+						"creatorType": "author"
+					}
+				],
+				"date": "1891",
+				"publisher": "Uniontown, Ala. : Canebrake Agricultural Experiment Station",
+				"attachments": [],
+				"tags": [
+					{
+						"tag": "Corn -- Field experiments"
+					},
+					{
+						"tag": "Corn -- Varieties"
+					},
+					{
+						"tag": "Corn -- Yields"
+					}
+				],
+				"notes": [],
+				"seeAlso": []
+			}
+		]
+	},
+	{
+		"type": "import",
+		"input": "%0 Serial\n%0 Audio\n%I Studio Omega, Verein für Christliche Radioarbeit\n%D 2021\n%C Wien\n%G German\n%T Diesseits von Eden: der Podcast der katholischen Fakultäten Österreichs & Südtirols\n%U https://diesseits.theopodcast.at/home",
+		"items": [
+			{
+				"itemType": "audioRecording",
+				"title": "Diesseits von Eden: der Podcast der katholischen Fakultäten Österreichs & Südtirols",
+				"creators": [],
+				"date": "2021",
+				"label": "Studio Omega, Verein für Christliche Radioarbeit",
+				"language": "German",
+				"place": "Wien",
+				"url": "https://diesseits.theopodcast.at/home",
+				"attachments": [],
+				"tags": [],
+				"notes": [],
 				"seeAlso": []
 			}
 		]
